@@ -269,4 +269,346 @@ version = '4.0.0'
         graph.IsDevelopmentDependency(bazId).Should().BeFalse();
         graph.IsDevelopmentDependency(devonlyId).Should().BeTrue();
     }
+
+    [TestMethod]
+    public async Task TestUvLockDetector_MultipleDevGroups_AllMarkedDevAsync()
+    {
+        var uvLock = @"[[package]]
+name = 'myproject'
+version = '0.1.0'
+source = { virtual = '.' }
+dependencies = [
+    { name = 'requests' },
+]
+[package.metadata]
+requires-dist = [
+    { name = 'requests', specifier = '>=2.0' },
+]
+[package.metadata.requires-dev]
+dev = [
+    { name = 'pytest', specifier = '>=8.0' },
+]
+lint = [
+    { name = 'ruff', specifier = '>=0.4' },
+]
+test = [
+    { name = 'coverage', specifier = '>=7.0' },
+]
+[[package]]
+name = 'requests'
+version = '2.32.0'
+[[package]]
+name = 'pytest'
+version = '8.0.0'
+[[package]]
+name = 'ruff'
+version = '0.4.0'
+[[package]]
+name = 'coverage'
+version = '7.0.0'
+";
+        var (scanResult, componentRecorder) = await this.detectorTestUtility
+            .WithFile("uv.lock", uvLock)
+            .ExecuteDetectorAsync();
+
+        scanResult.ResultCode.Should().Be(ProcessingResultCode.Success);
+        var detected = componentRecorder.GetDetectedComponents().ToList();
+        var graph = componentRecorder.GetDependencyGraphsByLocation().Values.First();
+
+        detected.Should().HaveCount(4);
+
+        graph.IsDevelopmentDependency(new PipComponent("requests", "2.32.0").Id).Should().BeFalse();
+        graph.IsDevelopmentDependency(new PipComponent("pytest", "8.0.0").Id).Should().BeTrue();
+        graph.IsDevelopmentDependency(new PipComponent("ruff", "0.4.0").Id).Should().BeTrue();
+        graph.IsDevelopmentDependency(new PipComponent("coverage", "7.0.0").Id).Should().BeTrue();
+    }
+
+    [TestMethod]
+    public async Task TestUvLockDetector_TransitiveDevDeps_MarkedDevAsync()
+    {
+        var uvLock = @"[[package]]
+name = 'myproject'
+version = '0.1.0'
+source = { virtual = '.' }
+dependencies = [
+    { name = 'flask' },
+]
+[package.metadata]
+requires-dist = [
+    { name = 'flask', specifier = '>=3.0' },
+]
+[package.metadata.requires-dev]
+dev = [
+    { name = 'pytest', specifier = '>=8.0' },
+]
+[[package]]
+name = 'flask'
+version = '3.0.0'
+[[package]]
+name = 'pytest'
+version = '8.0.0'
+dependencies = [
+    { name = 'pluggy' },
+]
+[[package]]
+name = 'pluggy'
+version = '1.5.0'
+";
+        var (scanResult, componentRecorder) = await this.detectorTestUtility
+            .WithFile("uv.lock", uvLock)
+            .ExecuteDetectorAsync();
+
+        scanResult.ResultCode.Should().Be(ProcessingResultCode.Success);
+        var graph = componentRecorder.GetDependencyGraphsByLocation().Values.First();
+
+        // flask is a production dependency
+        graph.IsDevelopmentDependency(new PipComponent("flask", "3.0.0").Id).Should().BeFalse();
+
+        // pytest is a direct dev dependency
+        graph.IsDevelopmentDependency(new PipComponent("pytest", "8.0.0").Id).Should().BeTrue();
+
+        // pluggy is a transitive dep of pytest only — should be dev
+        graph.IsDevelopmentDependency(new PipComponent("pluggy", "1.5.0").Id).Should().BeTrue();
+    }
+
+    [TestMethod]
+    public async Task TestUvLockDetector_SharedTransitiveDep_NotMarkedDevAsync()
+    {
+        var uvLock = @"[[package]]
+name = 'myproject'
+version = '0.1.0'
+source = { virtual = '.' }
+dependencies = [
+    { name = 'flask' },
+]
+[package.metadata]
+requires-dist = [
+    { name = 'flask', specifier = '>=3.0' },
+]
+[package.metadata.requires-dev]
+dev = [
+    { name = 'pytest', specifier = '>=8.0' },
+]
+[[package]]
+name = 'flask'
+version = '3.0.0'
+dependencies = [
+    { name = 'click' },
+]
+[[package]]
+name = 'pytest'
+version = '8.0.0'
+dependencies = [
+    { name = 'click' },
+    { name = 'pluggy' },
+]
+[[package]]
+name = 'click'
+version = '8.1.0'
+[[package]]
+name = 'pluggy'
+version = '1.5.0'
+";
+        var (scanResult, componentRecorder) = await this.detectorTestUtility
+            .WithFile("uv.lock", uvLock)
+            .ExecuteDetectorAsync();
+
+        scanResult.ResultCode.Should().Be(ProcessingResultCode.Success);
+        var graph = componentRecorder.GetDependencyGraphsByLocation().Values.First();
+
+        // click is shared between flask (prod) and pytest (dev) — should NOT be dev
+        graph.IsDevelopmentDependency(new PipComponent("click", "8.1.0").Id).Should().BeFalse();
+
+        // pluggy is only reachable from pytest (dev) — should be dev
+        graph.IsDevelopmentDependency(new PipComponent("pluggy", "1.5.0").Id).Should().BeTrue();
+    }
+
+    [TestMethod]
+    public async Task TestUvLockDetector_GitSource_RegistersGitComponentAsync()
+    {
+        var uvLock = @"[[package]]
+name = 'myproject'
+version = '0.1.0'
+source = { virtual = '.' }
+dependencies = [
+    { name = 'httpx' },
+]
+[package.metadata]
+requires-dist = [
+    { name = 'httpx' },
+]
+[[package]]
+name = 'httpx'
+version = '0.27.0'
+source = { git = 'https://github.com/encode/httpx?tag=0.27.0#abc123def456abc123def456abc123def456abcd' }
+";
+        var (scanResult, componentRecorder) = await this.detectorTestUtility
+            .WithFile("uv.lock", uvLock)
+            .ExecuteDetectorAsync();
+
+        scanResult.ResultCode.Should().Be(ProcessingResultCode.Success);
+        var detected = componentRecorder.GetDetectedComponents().ToList();
+        detected.Should().ContainSingle();
+
+        var component = detected.First().Component;
+        component.Should().BeOfType<GitComponent>();
+        var gitComponent = (GitComponent)component;
+        gitComponent.RepositoryUrl.Should().Be(new Uri("https://github.com/encode/httpx"));
+        gitComponent.CommitHash.Should().Be("abc123def456abc123def456abc123def456abcd");
+    }
+
+    [TestMethod]
+    public async Task TestUvLockDetector_MixedRegistryAndGitSources_CorrectTypesAsync()
+    {
+        var uvLock = @"[[package]]
+name = 'myproject'
+version = '0.1.0'
+source = { virtual = '.' }
+dependencies = [
+    { name = 'requests' },
+    { name = 'httpx' },
+]
+[package.metadata]
+requires-dist = [
+    { name = 'requests', specifier = '>=2.0' },
+    { name = 'httpx' },
+]
+[[package]]
+name = 'requests'
+version = '2.32.0'
+source = { registry = 'https://pypi.org/simple' }
+[[package]]
+name = 'httpx'
+version = '0.27.0'
+source = { git = 'https://github.com/encode/httpx?tag=0.27.0#aabbccdd11223344aabbccdd11223344aabbccdd' }
+";
+        var (scanResult, componentRecorder) = await this.detectorTestUtility
+            .WithFile("uv.lock", uvLock)
+            .ExecuteDetectorAsync();
+
+        scanResult.ResultCode.Should().Be(ProcessingResultCode.Success);
+        var detected = componentRecorder.GetDetectedComponents().ToList();
+        detected.Should().HaveCount(2);
+
+        var pipComponents = detected.Where(d => d.Component is PipComponent).ToList();
+        var gitComponents = detected.Where(d => d.Component is GitComponent).ToList();
+
+        pipComponents.Should().ContainSingle();
+        gitComponents.Should().ContainSingle();
+
+        ((PipComponent)pipComponents.First().Component).Name.Should().Be("requests");
+        ((GitComponent)gitComponents.First().Component).RepositoryUrl.Should().Be(new Uri("https://github.com/encode/httpx"));
+    }
+
+    [TestMethod]
+    public async Task TestUvLockDetector_DuplicatePackageName_HandledGracefullyAsync()
+    {
+        var uvLock = @"[[package]]
+name = 'myproject'
+version = '0.1.0'
+source = { virtual = '.' }
+dependencies = [
+    { name = 'shared', specifier = '>=1.0.0' },
+]
+[package.metadata]
+requires-dist = [
+    { name = 'shared', specifier = '>=2.0.0' },
+]
+[[package]]
+name = 'shared'
+version = '1.0.0'
+dependencies = [
+    { name = 'subdep', specifier = '>=1.0.0' },
+]
+[[package]]
+name = 'shared'
+version = '2.0.0'
+dependencies = [
+    { name = 'subdep', specifier = '>=2.0.0' },
+]
+[[package]]
+name = 'subdep'
+version = '1.0.0'
+[[package]]
+name = 'subdep'
+version = '2.0.0'
+";
+        var (scanResult, componentRecorder) = await this.detectorTestUtility
+            .WithFile("uv.lock", uvLock)
+            .ExecuteDetectorAsync();
+
+        scanResult.ResultCode.Should().Be(ProcessingResultCode.Success);
+        var detected = componentRecorder.GetDetectedComponents().ToList();
+
+        detected.Should().HaveCount(4);
+        detected.Select(d => (((PipComponent)d.Component).Name, ((PipComponent)d.Component).Version))
+            .Should().BeEquivalentTo([("shared", "1.0.0"), ("shared", "2.0.0"), ("subdep", "1.0.0"), ("subdep", "2.0.0")]);
+
+        var graph = componentRecorder.GetDependencyGraphsByLocation().Values.First();
+        var shared1Id = new PipComponent("shared", "1.0.0").Id;
+        var shared2Id = new PipComponent("shared", "2.0.0").Id;
+        var subdep1Id = new PipComponent("subdep", "1.0.0").Id;
+        var subdep2Id = new PipComponent("subdep", "2.0.0").Id;
+
+        graph.GetDependenciesForComponent(shared1Id).Should().BeEquivalentTo([subdep1Id]);
+        graph.GetDependenciesForComponent(shared2Id).Should().BeEquivalentTo([subdep2Id]);
+        graph.GetDependenciesForComponent(subdep1Id).Should().BeEmpty();
+        graph.GetDependenciesForComponent(subdep2Id).Should().BeEmpty();
+    }
+
+    [TestMethod]
+    public async Task TestUvLockDetector_RecursiveDependency_DoesNotHangOrThrowAsync()
+    {
+        // Packages can reference each other cyclically (a -> b -> a). The detector must
+        // terminate and not throw when traversing such a cycle.
+        var uvLock = @"[[package]]
+name = 'myproject'
+version = '0.1.0'
+source = { virtual = '.' }
+dependencies = [
+    { name = 'a' },
+]
+[package.metadata]
+requires-dist = [
+    { name = 'a' },
+]
+[[package]]
+name = 'a'
+version = '1.0.0'
+dependencies = [
+    { name = 'b' },
+]
+[[package]]
+name = 'b'
+version = '2.0.0'
+dependencies = [
+    { name = 'a' },
+]
+";
+
+        var executeTask = this.detectorTestUtility
+            .WithFile("uv.lock", uvLock)
+            .ExecuteDetectorAsync();
+
+        // Guard against an infinite loop: the detection must complete promptly.
+        var completed = await Task.WhenAny(executeTask, Task.Delay(TimeSpan.FromSeconds(30)));
+        completed.Should().Be(executeTask, "the detector should terminate on a cyclic dependency graph");
+
+        var (scanResult, componentRecorder) = await executeTask;
+
+        scanResult.ResultCode.Should().Be(ProcessingResultCode.Success);
+        var detected = componentRecorder.GetDetectedComponents().ToList();
+
+        detected.Should().HaveCount(2);
+        detected.Select(d => ((PipComponent)d.Component).Name)
+            .Should().BeEquivalentTo(["a", "b"]);
+
+        var graph = componentRecorder.GetDependencyGraphsByLocation().Values.First();
+        var aId = new PipComponent("a", "1.0.0").Id;
+        var bId = new PipComponent("b", "2.0.0").Id;
+
+        // The cycle is preserved in the graph without causing a hang.
+        graph.GetDependenciesForComponent(aId).Should().BeEquivalentTo([bId]);
+        graph.GetDependenciesForComponent(bId).Should().BeEquivalentTo([aId]);
+    }
 }
